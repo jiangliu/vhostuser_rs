@@ -1,0 +1,6 @@
+[package]
+name = "vhostuser_rs"
+version = "0.1.0"
+authors = ["Liu Jiang <gerry@linux.alibaba.com>"]
+
+[dependencies]
