@@ -28,6 +28,9 @@ extern crate bitflags;
 mod connection;
 pub use connection::{Endpoint, Listener};
 
+mod master;
+pub use master::{Master, UserMemoryContext, VhostUserMaster};
+
 pub mod message;
 
 #[derive(Debug)]
@@ -46,6 +49,16 @@ pub enum Error {
     PartialMessage,
     /// Invalid message format or flags
     InvalidMessage,
+    /// Invalid value in message fields
+    InvalidContent,
+    /// Underline socket has been closed due to errors
+    AlreadyClosed,
+    /// Some parameters is invalid
+    InvalidParam,
+    /// Invalid operation because protocol feature is disabled
+    InvalidOperation,
+    /// Operation failed on slave side
+    OperationFailedInSlave,
 }
 
 impl std::convert::From<nix::Error> for Error {
