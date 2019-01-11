@@ -4,3 +4,8 @@ version = "0.1.0"
 authors = ["Liu Jiang <gerry@linux.alibaba.com>"]
 
 [dependencies]
+libc = ">=0.2.39"
+nix = ">=0.12"
+
+[dev-dependencies]
+tempfile = "3.0.5"
