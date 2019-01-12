@@ -40,6 +40,12 @@ pub enum Error {
     NixError(nix::Error),
     /// Fd array in question is too big or too small
     FdArrayCapacity,
+    /// Message is too large
+    OversizedMsg,
+    /// Only part of a message have been sent or received successfully
+    PartialMessage,
+    /// Invalid message format or flags
+    InvalidMessage,
 }
 
 impl std::convert::From<nix::Error> for Error {

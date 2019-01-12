@@ -6,7 +6,9 @@ use nix::sys::uio::IoVec;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::{mem, slice};
 
+use super::message::*;
 use super::{Error, Result};
 
 /// Unix domain socket listener for vhost-user slaves.
@@ -72,6 +74,9 @@ impl Endpoint {
     /// attached file descriptors.
     pub fn send_iovec(&mut self, iov: &[IoVec<&[u8]>], fds: Option<&[RawFd]>) -> Result<usize> {
         if let Some(rfds) = fds {
+            if rfds.len() > MAX_ATTECHED_FD_ENTRIES {
+                return Err(Error::FdArrayCapacity);
+            }
             sendmsg(
                 self.as_raw_fd(),
                 iov,
@@ -90,6 +95,86 @@ impl Endpoint {
     pub fn send_slice(&mut self, data: &[u8], fds: Option<&[RawFd]>) -> Result<usize> {
         let iov = [IoVec::from_slice(data)];
         self.send_iovec(&iov[..], fds)
+    }
+
+    /// Sends a header-only message with optional attached file descriptors.
+    pub fn send_header(&mut self, hdr: &VhostUserMsgHeader, fds: Option<&[RawFd]>) -> Result<()> {
+        let iovs = [IoVec::from_slice(unsafe {
+            slice::from_raw_parts(
+                hdr as *const VhostUserMsgHeader as *const u8,
+                mem::size_of::<VhostUserMsgHeader>(),
+            )
+        })];
+        let bytes = self.send_iovec(&iovs[..], fds)?;
+        if bytes != mem::size_of::<VhostUserMsgHeader>() {
+            return Err(Error::PartialMessage);
+        }
+        Ok(())
+    }
+
+    /// Send a message with header and body. Optional file descriptors may be
+    /// attached to the message.
+    pub fn send_message<T: Sized>(
+        &mut self,
+        hdr: &VhostUserMsgHeader,
+        body: &T,
+        fds: Option<&[RawFd]>,
+    ) -> Result<()> {
+        let iovs = [
+            IoVec::from_slice(unsafe {
+                slice::from_raw_parts(
+                    hdr as *const VhostUserMsgHeader as *const u8,
+                    mem::size_of::<VhostUserMsgHeader>(),
+                )
+            }),
+            IoVec::from_slice(unsafe {
+                slice::from_raw_parts(body as *const T as *const u8, mem::size_of::<T>())
+            }),
+        ];
+        let bytes = self.send_iovec(&iovs[..], fds)?;
+        if bytes != mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>() {
+            return Err(Error::PartialMessage);
+        }
+        Ok(())
+    }
+
+    /// Send a message with header, body and payload. Optional file descriptors
+    /// may also be attached to the message.
+    pub fn send_message_with_payload<T: Sized, P: Sized>(
+        &mut self,
+        hdr: &VhostUserMsgHeader,
+        body: &T,
+        payload: &[P],
+        fds: Option<&[RawFd]>,
+    ) -> Result<()> {
+        let len = payload.len() * mem::size_of::<P>();
+        if len > MAX_MSG_SIZE - mem::size_of::<T>() {
+            return Err(Error::OversizedMsg);
+        }
+        if let Some(fd_arr) = fds {
+            if fd_arr.len() > MAX_ATTECHED_FD_ENTRIES {
+                return Err(Error::FdArrayCapacity);
+            }
+        }
+
+        let iovs = [
+            IoVec::from_slice(unsafe {
+                slice::from_raw_parts(
+                    hdr as *const VhostUserMsgHeader as *const u8,
+                    mem::size_of::<VhostUserMsgHeader>(),
+                )
+            }),
+            IoVec::from_slice(unsafe {
+                slice::from_raw_parts(body as *const T as *const u8, mem::size_of::<T>())
+            }),
+            IoVec::from_slice(unsafe { slice::from_raw_parts(payload.as_ptr() as *const u8, len) }),
+        ];
+        let len = self.send_iovec(&iovs, fds)?;
+        let total = mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>() + len;
+        if len != total {
+            return Err(Error::PartialMessage);
+        }
+        Ok(())
     }
 
     /// Reads bytes from the socket into the given scatter/gather array with
@@ -144,6 +229,132 @@ impl Endpoint {
         };
         Ok((bytes, buf, rfds))
     }
+
+    /// Receive a message with header and optional content. Callers need to
+    /// pre-allocate a big enough buffer to receive the message body and
+    /// optional payload. If there are attached file descriptor associated
+    /// with the message, the first MAX_ATTECHED_FD_ENTRIES file descriptors
+    /// will be accepted and all other file descriptor will be discard
+    /// silently.
+    pub fn recv_message_into_buf(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<(VhostUserMsgHeader, usize, Option<Vec<RawFd>>)> {
+        let mut hdr = VhostUserMsgHeader::default();
+        let iovs = [
+            IoVec::from_mut_slice(unsafe {
+                slice::from_raw_parts_mut(
+                    (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
+                    mem::size_of::<VhostUserMsgHeader>(),
+                )
+            }),
+            IoVec::from_mut_slice(buf),
+        ];
+        let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
+
+        if bytes < mem::size_of::<VhostUserMsgHeader>() {
+            return Err(Error::PartialMessage);
+        } else if !hdr.is_valid() {
+            return Err(Error::InvalidMessage);
+        }
+
+        Ok((hdr, bytes - mem::size_of::<VhostUserMsgHeader>(), rfds))
+    }
+
+    /// Receive a header-only message with optional attached file descriptors.
+    /// Note, only the first MAX_ATTECHED_FD_ENTRIES file descriptors will be
+    /// accepted and all other file descriptor will be discard silently.
+    pub fn recv_header(&mut self) -> Result<(VhostUserMsgHeader, Option<Vec<RawFd>>)> {
+        let mut hdr = VhostUserMsgHeader::default();
+        let iovs = [IoVec::from_mut_slice(unsafe {
+            slice::from_raw_parts_mut(
+                (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
+                mem::size_of::<VhostUserMsgHeader>(),
+            )
+        })];
+        let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
+
+        if bytes != mem::size_of::<VhostUserMsgHeader>() {
+            return Err(Error::PartialMessage);
+        } else if !hdr.is_valid() {
+            return Err(Error::InvalidMessage);
+        }
+
+        Ok((hdr, rfds))
+    }
+
+    /// Receive a message with optional attached file descriptors.
+    /// Note, only the first MAX_ATTECHED_FD_ENTRIES file descriptors will be
+    /// accepted and all other file descriptor will be discard silently.
+    pub fn recv_message<T: Sized + Default + VhostUserMsgValidator>(
+        &mut self,
+    ) -> Result<(VhostUserMsgHeader, T, Option<Vec<RawFd>>)> {
+        let mut hdr = VhostUserMsgHeader::default();
+        let mut body: T = Default::default();
+        let iovs = [
+            IoVec::from_mut_slice(unsafe {
+                slice::from_raw_parts_mut(
+                    (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
+                    mem::size_of::<VhostUserMsgHeader>(),
+                )
+            }),
+            IoVec::from_mut_slice(unsafe {
+                slice::from_raw_parts_mut((&mut body as *mut T) as *mut u8, mem::size_of::<T>())
+            }),
+        ];
+        let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
+
+        let total = mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>();
+        if bytes != total {
+            return Err(Error::PartialMessage);
+        } else if !hdr.is_valid() || !body.is_valid() {
+            return Err(Error::InvalidMessage);
+        }
+
+        Ok((hdr, body, rfds))
+    }
+
+    /// Receive a message with optional payload and attached file descriptors.
+    /// Note, only the first MAX_ATTECHED_FD_ENTRIES file descriptors will be
+    /// accepted and all other file descriptor will be discard silently.
+    pub fn recv_message_with_payload<T: Sized + Default + VhostUserMsgValidator>(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<(VhostUserMsgHeader, T, usize, Option<Vec<RawFd>>)> {
+        let mut hdr = VhostUserMsgHeader::default();
+        let mut body: T = Default::default();
+        let iovs = [
+            IoVec::from_mut_slice(unsafe {
+                slice::from_raw_parts_mut(
+                    (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
+                    mem::size_of::<VhostUserMsgHeader>(),
+                )
+            }),
+            IoVec::from_mut_slice(unsafe {
+                slice::from_raw_parts_mut((&mut body as *mut T) as *mut u8, mem::size_of::<T>())
+            }),
+            IoVec::from_mut_slice(buf),
+        ];
+        let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
+
+        let total = mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>();
+        if bytes < total {
+            return Err(Error::PartialMessage);
+        } else if !hdr.is_valid() || !body.is_valid() {
+            return Err(Error::InvalidMessage);
+        }
+
+        Ok((hdr, body, bytes - total, rfds))
+    }
+
+    /// Close all raw file descriptors.
+    pub fn close_rfds(rfds: Option<Vec<RawFd>>) {
+        if let Some(fds) = rfds {
+            for fd in fds {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+    }
 }
 
 impl AsRawFd for Endpoint {
@@ -167,6 +378,7 @@ mod tests {
     const UNIX_SOCKET_CONNECTION: &'static str = "/tmp/vhost_user_test_rust_connection";
     const UNIX_SOCKET_DATA: &'static str = "/tmp/vhost_user_test_rust_data";
     const UNIX_SOCKET_FD: &'static str = "/tmp/vhost_user_test_rust_fd";
+    const UNIX_SOCKET_SEND: &'static str = "/tmp/vhost_user_test_rust_send";
 
     fn remove_temp_file(path: &str) {
         let _ = fs::remove_file(path);
@@ -368,5 +580,43 @@ mod tests {
         let (bytes, _, rfds) = slave.recv_into_buf::<[RawFd; 2]>(0x4).unwrap();
         assert_eq!(bytes, 4);
         assert!(rfds.is_some());
+
+        Endpoint::close_rfds(rfds);
+        Endpoint::close_rfds(None);
+    }
+
+    #[test]
+    fn send_recv() {
+        remove_temp_file(UNIX_SOCKET_SEND);
+        let listener = Listener::new(UNIX_SOCKET_SEND).unwrap();
+        let mut master = Endpoint::new_master(UNIX_SOCKET_SEND).unwrap();
+        let mut slave = listener.accept().unwrap().unwrap();
+
+        let mut hdr1 = VhostUserMsgHeader::new(
+            VhostUserRequestCode::GET_FEATURES,
+            0,
+            mem::size_of::<u64>() as u32,
+        );
+        hdr1.set_need_reply(true);
+        let features1 = 0x1u64;
+        master.send_message(&hdr1, &features1, None).unwrap();
+
+        let mut features2 = 0u64;
+        let slice = unsafe {
+            slice::from_raw_parts_mut(
+                (&mut features2 as *mut u64) as *mut u8,
+                mem::size_of::<u64>(),
+            )
+        };
+        let (hdr2, bytes, rfds) = slave.recv_message_into_buf(slice).unwrap();
+        assert_eq!(hdr1, hdr2);
+        assert_eq!(bytes, 8);
+        assert_eq!(features1, features2);
+        assert!(rfds.is_none());
+
+        master.send_header(&hdr1, None).unwrap();
+        let (hdr2, rfds) = slave.recv_header().unwrap();
+        assert_eq!(hdr1, hdr2);
+        assert!(rfds.is_none());
     }
 }
