@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Liu Jiang <gerry@linux.alibaba.com>"]
 
 [dependencies]
+bitflags = ">=1.0.1"
 libc = ">=0.2.39"
 nix = ">=0.12"
 

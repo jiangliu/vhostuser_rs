@@ -22,9 +22,13 @@
 /// vhost-user have an equivalent ioctl to the kernel implementation.
 extern crate libc;
 extern crate nix;
+#[macro_use]
+extern crate bitflags;
 
 mod connection;
 pub use connection::{Endpoint, Listener};
+
+pub mod message;
 
 #[derive(Debug)]
 pub enum Error {
