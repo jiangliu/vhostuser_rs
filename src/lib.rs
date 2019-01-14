@@ -31,6 +31,9 @@ pub use connection::{Endpoint, Listener};
 mod master;
 pub use master::{Master, UserMemoryContext, VhostUserMaster};
 
+mod slave;
+pub use slave::{Slave, VhostUserSlave};
+
 pub mod message;
 
 #[derive(Debug)]
