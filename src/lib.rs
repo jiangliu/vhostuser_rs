@@ -26,15 +26,15 @@ extern crate nix;
 extern crate bitflags;
 
 mod connection;
-pub use connection::{Endpoint, Listener};
-
+#[cfg(test)]
+mod dummy_slave;
 mod master;
-pub use master::{Master, UserMemoryContext, VhostUserMaster};
-
-mod slave;
-pub use slave::{Slave, VhostUserSlave};
-
 pub mod message;
+mod slave;
+
+pub use connection::{Endpoint, Listener};
+pub use master::{Master, UserMemoryContext, VhostUserMaster};
+pub use slave::{Slave, VhostUserSlave};
 
 #[derive(Debug)]
 pub enum Error {
@@ -73,4 +73,90 @@ impl std::convert::From<nix::Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::dummy_slave::{DummySlave, VIRTIO_FEATURES};
+    use super::message::*;
+    use super::*;
+    use std::fs;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    fn remove_temp_file(path: &str) {
+        let _ = fs::remove_file(path);
+    }
+
+    fn create_slave<S: VhostUserSlave>(path: &str, backend: Arc<Mutex<S>>) -> (Master, Slave<S>) {
+        remove_temp_file(path);
+        let listener = Listener::new(path).unwrap();
+        let master = Master::new(path).unwrap();
+        let slave_fd = listener.accept().unwrap().unwrap();
+        (master, Slave::new(slave_fd, backend))
+    }
+
+    #[test]
+    fn create_dummy_slave() {
+        let mut slave = DummySlave::new();
+
+        slave.set_owner().unwrap();
+        assert!(slave.set_owner().is_err());
+    }
+
+    #[test]
+    fn test_set_owner() {
+        let slave_be = Arc::new(Mutex::new(DummySlave::new()));
+        let (mut master, mut slave) =
+            create_slave("/tmp/vhost_user_lib_unit_test_owner", slave_be.clone());
+
+        assert_eq!(slave_be.lock().unwrap().owned, false);
+        master.set_owner().unwrap();
+        slave.handle_request().unwrap();
+        assert_eq!(slave_be.lock().unwrap().owned, true);
+        master.set_owner().unwrap();
+        assert!(slave.handle_request().is_err());
+        assert_eq!(slave_be.lock().unwrap().owned, true);
+    }
+
+    #[test]
+    fn test_set_features() {
+        let mbar = Arc::new(Barrier::new(2));
+        let sbar = mbar.clone();
+        let slave_be = Arc::new(Mutex::new(DummySlave::new()));
+        let (mut master, mut slave) =
+            create_slave("/tmp/vhost_user_lib_unit_test_feature", slave_be.clone());
+
+        thread::spawn(move || {
+            slave.handle_request().unwrap();
+            assert_eq!(slave_be.lock().unwrap().owned, true);
+
+            slave.handle_request().unwrap();
+            slave.handle_request().unwrap();
+            assert_eq!(
+                slave_be.lock().unwrap().acked_features,
+                VIRTIO_FEATURES & !0x1
+            );
+
+            slave.handle_request().unwrap();
+            slave.handle_request().unwrap();
+            assert_eq!(
+                slave_be.lock().unwrap().acked_protocol_features,
+                VhostUserProtocolFeatures::all().bits()
+            );
+
+            sbar.wait();
+        });
+
+        master.set_owner().unwrap();
+
+        // set virtio features
+        let features = master.get_features().unwrap();
+        assert_eq!(features, VIRTIO_FEATURES);
+        master.set_features(VIRTIO_FEATURES & !0x1).unwrap();
+
+        // set vhost protocol features
+        let features = master.get_protocol_features().unwrap();
+        assert_eq!(features, VhostUserProtocolFeatures::all().bits());
+        master.set_protocol_features(features).unwrap();
+
+        mbar.wait();
+    }
+}
