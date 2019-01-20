@@ -3,6 +3,11 @@ name = "vhostuser_rs"
 version = "0.1.0"
 authors = ["Liu Jiang <gerry@linux.alibaba.com>"]
 
+description = "Rust implementation of vhost-user protocol"
+readme = "README.md"
+keywords = ["vhost-user", "virtio"]
+license = "Apache-2.0"
+
 [dependencies]
 bitflags = ">=1.0.1"
 libc = ">=0.2.39"
