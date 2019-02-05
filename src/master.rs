@@ -426,7 +426,7 @@ impl UserMemoryContext {
 }
 
 struct MasterInternal {
-    // Underline Unix domain socket for communication
+    // Underlying Unix domain socket for communication
     fd: Endpoint,
     // Path of Unix domain socket listener to connect to
     path: String,

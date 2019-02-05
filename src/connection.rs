@@ -181,7 +181,7 @@ impl Endpoint {
     /// optional attached file descriptors. Received file descriptors are set
     /// close-on-exec.
     ///
-    /// The underline communication channel is a Unix domain socket in STREAM
+    /// The underlying communication channel is a Unix domain socket in STREAM
     /// mode. It's a little tricky to pass file descriptors through such a
     /// communication channel. Let's assume that a sender sending a message
     /// with some file descriptors attached. To successfully receive those

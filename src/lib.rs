@@ -15,7 +15,7 @@
 /// created by the master issuing a VHOST_USER_SET_SLAVE_REQ_FD request to
 /// the slave with an auxiliary file descriptor.
 ///
-/// Unix domain socket is used as the underline communication channel because
+/// Unix domain socket is used as the underlying communication channel because
 /// the master needs to send file descriptors to the slave.
 ///
 /// Most messages that can be sent via the Unix domain socket implementing
@@ -54,7 +54,7 @@ pub enum Error {
     InvalidMessage,
     /// Invalid value in message fields
     InvalidContent,
-    /// Underline socket has been closed due to errors
+    /// Underlying socket has been closed due to errors
     AlreadyClosed,
     /// Some parameters is invalid
     InvalidParam,

@@ -49,7 +49,7 @@ pub trait VhostUserSlave {
 /// A vhost-user slave endpoint which relays all received requests from the
 /// master to the virtio backend device object.
 pub struct Slave<S: VhostUserSlave> {
-    // underline Unix domain socket for communication
+    // underlying Unix domain socket for communication
     fd: Endpoint,
     // the VirtIO backend device object
     backend: Arc<Mutex<S>>,
@@ -94,7 +94,7 @@ impl<S: VhostUserSlave> Slave<S> {
         // Return error if the endpoint is already in failed state.
         self.check_state()?;
 
-        // The underline communication channel is a Unix domain socket in
+        // The underlying communication channel is a Unix domain socket in
         // stream mode, and recvmsg() is a little tricky here. To successfully
         // receive attached file descriptors, we need to receive messages and
         // corresponding attached file descriptors in this way:
