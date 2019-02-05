@@ -39,6 +39,13 @@ impl Listener {
             }
         }
     }
+
+    /// Change blocking status on the listener.
+    pub fn set_nonblocking(&self, block: bool) -> Result<()> {
+        self.fd.set_nonblocking(block)
+            .map_err(|e| Error::SocketError(e))
+    }
+
 }
 
 impl AsRawFd for Listener {
