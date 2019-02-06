@@ -154,7 +154,7 @@ mod tests {
 
         // set vhost protocol features
         let features = master.get_protocol_features().unwrap();
-        assert_eq!(features, VhostUserProtocolFeatures::all().bits());
+        assert_eq!(features.bits(), VhostUserProtocolFeatures::all().bits());
         master.set_protocol_features(features).unwrap();
 
         mbar.wait();
