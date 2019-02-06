@@ -20,8 +20,6 @@ impl Listener {
     /// Create a unix domain socket listener.
     pub fn new(path: &str) -> Result<Self> {
         let fd = UnixListener::bind(path).map_err(|e| Error::SocketError(e))?;
-        fd.set_nonblocking(true)
-            .map_err(|e| Error::SocketError(e))?;
         Ok(Listener { fd })
     }
 
@@ -401,6 +399,7 @@ mod tests {
     fn accept_connection() {
         remove_temp_file(UNIX_SOCKET_CONNECTION);
         let listener = Listener::new(UNIX_SOCKET_CONNECTION).unwrap();
+        listener.set_nonblocking(true).unwrap();
 
         // accept on a fd without incoming connection
         let conn = listener.accept().unwrap();
@@ -418,6 +417,7 @@ mod tests {
     fn send_data() {
         remove_temp_file(UNIX_SOCKET_DATA);
         let listener = Listener::new(UNIX_SOCKET_DATA).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let mut master = Endpoint::new_master(UNIX_SOCKET_DATA).unwrap();
         let mut slave = listener.accept().unwrap().unwrap();
 
@@ -442,6 +442,7 @@ mod tests {
     fn send_fd() {
         remove_temp_file(UNIX_SOCKET_FD);
         let listener = Listener::new(UNIX_SOCKET_FD).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let mut master = Endpoint::new_master(UNIX_SOCKET_FD).unwrap();
         let mut slave = listener.accept().unwrap().unwrap();
 
@@ -596,6 +597,7 @@ mod tests {
     fn send_recv() {
         remove_temp_file(UNIX_SOCKET_SEND);
         let listener = Listener::new(UNIX_SOCKET_SEND).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let mut master = Endpoint::new_master(UNIX_SOCKET_SEND).unwrap();
         let mut slave = listener.accept().unwrap().unwrap();
 

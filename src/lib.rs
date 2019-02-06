@@ -88,6 +88,7 @@ mod tests {
     fn create_slave<S: VhostUserSlave>(path: &str, backend: Arc<Mutex<S>>) -> (Master, Slave<S>) {
         remove_temp_file(path);
         let listener = Listener::new(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let master = Master::new(path).unwrap();
         let slave_fd = listener.accept().unwrap().unwrap();
         (master, Slave::new(slave_fd, backend))
