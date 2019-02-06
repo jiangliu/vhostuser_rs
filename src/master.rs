@@ -426,7 +426,7 @@ impl UserMemoryContext {
 }
 
 struct MasterInternal {
-    // Underline Unix domain socket for communication
+    // Underlying Unix domain socket for communication
     fd: Endpoint,
     // Path of Unix domain socket listener to connect to
     path: String,
@@ -626,6 +626,7 @@ mod tests {
     fn create_pair(path: &str) -> (Master, Endpoint) {
         remove_temp_file(path);
         let listener = Listener::new(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let master = Master::new(path).unwrap();
         let slave = listener.accept().unwrap().unwrap();
         (master, slave)
@@ -635,6 +636,7 @@ mod tests {
     fn create_master() {
         remove_temp_file(UNIX_SOCKET_MASTER);
         let listener = Listener::new(UNIX_SOCKET_MASTER).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let mut master = Master::new(UNIX_SOCKET_MASTER).unwrap();
         let mut slave = listener.accept().unwrap().unwrap();
 
@@ -662,6 +664,7 @@ mod tests {
 
         let listener = Listener::new(UNIX_SOCKET_MASTER2).unwrap();
         assert!(Listener::new(UNIX_SOCKET_MASTER2).is_err());
+        listener.set_nonblocking(true).unwrap();
 
         let master = Master::new(UNIX_SOCKET_MASTER2).unwrap();
         let _slave = listener.accept().unwrap().unwrap();
