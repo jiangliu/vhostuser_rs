@@ -13,7 +13,7 @@ pub trait VhostUserSlave {
     fn reset_owner(&mut self) -> Result<()>;
     fn get_features(&mut self) -> Result<u64>;
     fn set_features(&mut self, features: u64) -> Result<()>;
-    fn get_protocol_features(&mut self) -> Result<u64>;
+    fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures>;
     fn set_protocol_features(&mut self, features: u64) -> Result<()>;
 
     fn set_mem_table(&mut self, ctx: &[VhostUserMemoryRegion], fds: &[RawFd]) -> Result<()>;
@@ -56,7 +56,7 @@ pub struct Slave<S: VhostUserSlave> {
 
     virtio_features: u64,
     acked_virtio_features: u64,
-    protocol_features: u64,
+    protocol_features: VhostUserProtocolFeatures,
     acked_protocol_features: u64,
 
     // sending ack for messages without payload
@@ -73,7 +73,7 @@ impl<S: VhostUserSlave> Slave<S> {
             backend,
             virtio_features: 0,
             acked_virtio_features: 0,
-            protocol_features: 0,
+            protocol_features: VhostUserProtocolFeatures::empty(),
             acked_protocol_features: 0,
             reply_ack_enabled: false,
             failed: false,
@@ -144,7 +144,7 @@ impl<S: VhostUserSlave> Slave<S> {
             VhostUserRequestCode::GET_PROTOCOL_FEATURES => {
                 self.check_msg_size(&hdr, size, 0)?;
                 let features = self.backend.lock().unwrap().get_protocol_features()?;
-                let msg = VhostUserU64::new(features);
+                let msg = VhostUserU64::new(features.bits());
                 self.send_reply_message(&hdr, &msg)?;
                 self.protocol_features = features;
                 self.update_reply_ack_flag();
@@ -477,11 +477,11 @@ impl<S: VhostUserSlave> Slave<S> {
 
     fn update_reply_ack_flag(&mut self) {
         let vflag = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
-        let pflag = VhostUserProtocolFeatures::REPLY_ACK.bits();
+        let pflag = VhostUserProtocolFeatures::REPLY_ACK;
         if (self.virtio_features & vflag) != 0
             && (self.acked_virtio_features & vflag) != 0
-            && (self.protocol_features & pflag) != 0
-            && (self.acked_protocol_features & pflag) != 0
+            && self.protocol_features.contains(pflag)
+            && (self.acked_protocol_features & pflag.bits()) != 0
         {
             self.reply_ack_enabled = true;
         } else {
