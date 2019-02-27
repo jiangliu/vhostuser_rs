@@ -13,7 +13,7 @@ pub trait VhostUserSlave {
     fn reset_owner(&mut self) -> Result<()>;
     fn get_features(&mut self) -> Result<u64>;
     fn set_features(&mut self, features: u64) -> Result<()>;
-    fn get_protocol_features(&mut self) -> Result<u64>;
+    fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures>;
     fn set_protocol_features(&mut self, features: u64) -> Result<()>;
 
     fn set_mem_table(&mut self, ctx: &[VhostUserMemoryRegion], fds: &[RawFd]) -> Result<()>;
@@ -56,7 +56,7 @@ pub struct Slave<S: VhostUserSlave> {
 
     virtio_features: u64,
     acked_virtio_features: u64,
-    protocol_features: u64,
+    protocol_features: VhostUserProtocolFeatures,
     acked_protocol_features: u64,
 
     // sending ack for messages without payload
@@ -73,7 +73,7 @@ impl<S: VhostUserSlave> Slave<S> {
             backend,
             virtio_features: 0,
             acked_virtio_features: 0,
-            protocol_features: 0,
+            protocol_features: VhostUserProtocolFeatures::empty(),
             acked_protocol_features: 0,
             reply_ack_enabled: false,
             failed: false,
@@ -136,7 +136,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.update_reply_ack_flag();
             }
             VhostUserRequestCode::SET_FEATURES => {
-                let msg = self.extrack_msg_body::<VhostUserU64>(&hdr, size, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserU64>(&hdr, size, &buf)?;
                 self.backend.lock().unwrap().set_features(msg.value)?;
                 self.acked_virtio_features = msg.value;
                 self.update_reply_ack_flag();
@@ -144,13 +144,13 @@ impl<S: VhostUserSlave> Slave<S> {
             VhostUserRequestCode::GET_PROTOCOL_FEATURES => {
                 self.check_msg_size(&hdr, size, 0)?;
                 let features = self.backend.lock().unwrap().get_protocol_features()?;
-                let msg = VhostUserU64::new(features);
+                let msg = VhostUserU64::new(features.bits());
                 self.send_reply_message(&hdr, &msg)?;
                 self.protocol_features = features;
                 self.update_reply_ack_flag();
             }
             VhostUserRequestCode::SET_PROTOCOL_FEATURES => {
-                let msg = self.extrack_msg_body::<VhostUserU64>(&hdr, size, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserU64>(&hdr, size, &buf)?;
                 self.backend
                     .lock()
                     .unwrap()
@@ -172,7 +172,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.send_reply_message(&hdr, &msg)?;
             }
             VhostUserRequestCode::SET_VRING_NUM => {
-                let msg = self.extrack_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 let res = self
                     .backend
                     .lock()
@@ -181,7 +181,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.send_ack_message(&hdr, res)?;
             }
             VhostUserRequestCode::SET_VRING_ADDR => {
-                let msg = self.extrack_msg_body::<VhostUserVringAddr>(&hdr, size, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserVringAddr>(&hdr, size, &buf)?;
                 let flags = match VhostUserVringAddrFlags::from_bits(msg.flags) {
                     Some(val) => val,
                     None => return Err(Error::InvalidMessage),
@@ -197,7 +197,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.send_ack_message(&hdr, res)?;
             }
             VhostUserRequestCode::SET_VRING_BASE => {
-                let msg = self.extrack_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 let res = self
                     .backend
                     .lock()
@@ -206,7 +206,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.send_ack_message(&hdr, res)?;
             }
             VhostUserRequestCode::GET_VRING_BASE => {
-                let msg = self.extrack_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 let reply = self.backend.lock().unwrap().get_vring_base(msg.index)?;
                 self.send_reply_message(&hdr, &reply)?;
             }
@@ -229,7 +229,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.send_ack_message(&hdr, res)?;
             }
             VhostUserRequestCode::SET_VRING_ENABLE => {
-                let msg = self.extrack_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 if self.acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() == 0
                     && msg.index > 0
                 {
@@ -461,7 +461,7 @@ impl<S: VhostUserSlave> Slave<S> {
         }
     }
 
-    fn extrack_msg_body<'a, T: Sized + VhostUserMsgValidator>(
+    fn extract_msg_body<'a, T: Sized + VhostUserMsgValidator>(
         &self,
         hdr: &VhostUserMsgHeader,
         size: usize,
@@ -477,11 +477,11 @@ impl<S: VhostUserSlave> Slave<S> {
 
     fn update_reply_ack_flag(&mut self) {
         let vflag = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
-        let pflag = VhostUserProtocolFeatures::REPLY_ACK.bits();
+        let pflag = VhostUserProtocolFeatures::REPLY_ACK;
         if (self.virtio_features & vflag) != 0
             && (self.acked_virtio_features & vflag) != 0
-            && (self.protocol_features & pflag) != 0
-            && (self.acked_protocol_features & pflag) != 0
+            && self.protocol_features.contains(pflag)
+            && (self.acked_protocol_features & pflag.bits()) != 0
         {
             self.reply_ack_enabled = true;
         } else {

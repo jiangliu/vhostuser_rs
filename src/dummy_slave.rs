@@ -80,8 +80,8 @@ impl VhostUserSlave for DummySlave {
         Ok(())
     }
 
-    fn get_protocol_features(&mut self) -> Result<u64> {
-        Ok(VhostUserProtocolFeatures::all().bits())
+    fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures> {
+        Ok(VhostUserProtocolFeatures::all())
     }
 
     fn set_protocol_features(&mut self, features: u64) -> Result<()> {
