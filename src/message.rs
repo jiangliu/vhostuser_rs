@@ -1,7 +1,11 @@
 // Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(dead_code)]
 #![allow(non_camel_case_types)]
+
+use std::fmt::Debug;
+use std::marker::PhantomData;
 
 /// The vhost-user specification uses a field of u32 to store message length.
 /// On the other hand, preallocated buffers are needed to receive messages
@@ -26,10 +30,16 @@ pub const MAX_ATTECHED_FD_ENTRIES: usize = 32;
 pub const VHOST_USER_CONFIG_OFFSET: u32 = 0x100;
 pub const VHOST_USER_CONFIG_SIZE: u32 = 0x1000;
 
+pub(crate) trait Req:
+    Clone + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Into<u32>
+{
+    fn is_valid(&self) -> bool;
+}
+
 /// All request codes defined by the vhost-user protocol.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum VhostUserRequestCode {
+pub enum MasterReq {
     NOOP = 0,
     GET_FEATURES = 1,
     SET_FEATURES = 2,
@@ -64,9 +74,40 @@ pub enum VhostUserRequestCode {
     MAX_CMD = 31,
 }
 
-impl VhostUserRequestCode {
-    pub fn is_valid(&self) -> bool {
-        (*self > VhostUserRequestCode::NOOP) && (*self < VhostUserRequestCode::MAX_CMD)
+impl Into<u32> for MasterReq {
+    fn into(self) -> u32 {
+        self as u32
+    }
+}
+
+impl Req for MasterReq {
+    fn is_valid(&self) -> bool {
+        (*self > MasterReq::NOOP) && (*self < MasterReq::MAX_CMD)
+    }
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SlaveReq {
+    NONE = 0,
+    IOTLB_MSG = 1,
+    CONFIG_CHANGE_MSG = 2,
+    VRING_HOST_NOTIFIER_MSG = 3,
+    FS_MAP = 4,
+    FS_UNMAP = 5,
+    FS_SYNC = 6,
+    MAX_CMD = 7,
+}
+
+impl Into<u32> for SlaveReq {
+    fn into(self) -> u32 {
+        self as u32
+    }
+}
+
+impl Req for SlaveReq {
+    fn is_valid(&self) -> bool {
+        (*self > SlaveReq::NONE) && (*self < SlaveReq::MAX_CMD)
     }
 }
 
@@ -90,31 +131,34 @@ bitflags! {
 }
 
 /// Common message header for vhost-user requests and replies.
+#[allow(safe_packed_borrows)]
 #[repr(packed)]
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct VhostUserMsgHeader {
-    request: VhostUserRequestCode,
+pub(crate) struct VhostUserMsgHeader<R: Req> {
+    request: u32,
     flags: u32,
     size: u32,
+    _r: PhantomData<R>,
 }
 
-impl VhostUserMsgHeader {
-    pub fn new(request: VhostUserRequestCode, flags: u32, size: u32) -> Self {
+impl<R: Req> VhostUserMsgHeader<R> {
+    pub fn new(request: R, flags: u32, size: u32) -> Self {
         // Default to protocol version 1
         let fl = (flags & VhostUserHeaderFlag::ALL_FLAGS.bits()) | 0x1;
         VhostUserMsgHeader {
-            request,
+            request: request.into(),
             flags: fl,
             size,
+            _r: PhantomData,
         }
     }
 
-    pub fn get_code(&self) -> VhostUserRequestCode {
-        self.request
+    pub fn get_code(&self) -> R {
+        unsafe { std::mem::transmute_copy::<u32, R>(&self.request) }
     }
 
-    pub fn set_code(&mut self, request: VhostUserRequestCode) {
-        self.request = request
+    pub fn set_code(&mut self, request: R) {
+        self.request = request.into();
     }
 
     pub fn get_version(&self) -> u32 {
@@ -158,22 +202,23 @@ impl VhostUserMsgHeader {
         self.size = size;
     }
 
-    pub fn is_reply_for(&self, req: &VhostUserMsgHeader) -> bool {
+    pub fn is_reply_for(&self, req: &VhostUserMsgHeader<R>) -> bool {
         self.is_reply() && !req.is_reply() && self.get_code() == req.get_code()
     }
 }
 
-impl Default for VhostUserMsgHeader {
+impl<R: Req> Default for VhostUserMsgHeader<R> {
     fn default() -> Self {
         VhostUserMsgHeader {
-            request: VhostUserRequestCode::NOOP,
+            request: 0,
             flags: 0x1,
             size: 0,
+            _r: PhantomData,
         }
     }
 }
 
-impl VhostUserMsgValidator for VhostUserMsgHeader {
+impl<T: Req> VhostUserMsgValidator for VhostUserMsgHeader<T> {
     fn is_valid(&self) -> bool {
         if !self.get_code().is_valid() {
             return false;
@@ -432,6 +477,37 @@ pub struct VhostUserIotlb {
 }
 */
 
+bitflags! {
+    #[derive(Default)]
+    pub struct VhostUserFSSlaveMsgFlags: u64 {
+        const EMPTY = 0x0;
+        const MAP_R = 0x1;
+        const MAP_W = 0x2;
+    }
+}
+
+const VHOST_USER_FS_SLAVE_ENTRIES: usize = 8;
+
+#[repr(packed)]
+#[derive(Default)]
+pub struct VhostUserFSSlaveMsg {
+    pub fd_offset: [u64; VHOST_USER_FS_SLAVE_ENTRIES],
+    pub cache_offset: [u64; VHOST_USER_FS_SLAVE_ENTRIES],
+    pub len: [u64; VHOST_USER_FS_SLAVE_ENTRIES],
+    pub flags: [VhostUserFSSlaveMsgFlags; VHOST_USER_FS_SLAVE_ENTRIES],
+}
+
+impl VhostUserMsgValidator for VhostUserFSSlaveMsg {
+    fn is_valid(&self) -> bool {
+        for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
+            if ({ self.flags[i] }.bits() & !VhostUserFSSlaveMsgFlags::all().bits()) != 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,20 +515,20 @@ mod tests {
 
     #[test]
     fn check_request_code() {
-        let code = VhostUserRequestCode::NOOP;
+        let code = MasterReq::NOOP;
         assert!(!code.is_valid());
-        let code = VhostUserRequestCode::MAX_CMD;
+        let code = MasterReq::MAX_CMD;
         assert!(!code.is_valid());
-        let code = VhostUserRequestCode::GET_FEATURES;
+        let code = MasterReq::GET_FEATURES;
         assert!(code.is_valid());
     }
 
     #[test]
     fn msg_header_ops() {
-        let mut hdr = VhostUserMsgHeader::new(VhostUserRequestCode::GET_FEATURES, 0, 0x100);
-        assert_eq!(hdr.get_code(), VhostUserRequestCode::GET_FEATURES);
-        hdr.set_code(VhostUserRequestCode::SET_FEATURES);
-        assert_eq!(hdr.get_code(), VhostUserRequestCode::SET_FEATURES);
+        let mut hdr = VhostUserMsgHeader::new(MasterReq::GET_FEATURES, 0, 0x100);
+        assert_eq!(hdr.get_code(), MasterReq::GET_FEATURES);
+        hdr.set_code(MasterReq::SET_FEATURES);
+        assert_eq!(hdr.get_code(), MasterReq::SET_FEATURES);
 
         assert_eq!(hdr.get_version(), 0x1);
 
@@ -481,7 +557,7 @@ mod tests {
         hdr.set_size(0x100);
         assert_eq!(hdr.get_size(), 0x100);
         assert!(hdr.is_valid());
-        hdr.set_size((MAX_MSG_SIZE - mem::size_of::<VhostUserMsgHeader>()) as u32);
+        hdr.set_size((MAX_MSG_SIZE - mem::size_of::<VhostUserMsgHeader<MasterReq>>()) as u32);
         assert!(hdr.is_valid());
         hdr.set_size(0x0);
         assert!(hdr.is_valid());
