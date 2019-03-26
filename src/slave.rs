@@ -1,12 +1,14 @@
 // Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::message::*;
-use super::{Endpoint, Error, Result};
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::slice;
 use std::sync::{Arc, Mutex};
+
+use super::connection::{Endpoint, Listener};
+use super::message::*;
+use super::{Error, Result};
 
 pub trait VhostUserSlave {
     fn set_owner(&mut self) -> Result<()>;
@@ -46,11 +48,43 @@ pub trait VhostUserSlave {
     fn set_config(&mut self, offset: u32, buf: &[u8], flags: VhostUserConfigFlags) -> Result<()>;
 }
 
+pub struct SlaveListener<S: VhostUserSlave> {
+    listener: Listener,
+    backend: Option<Arc<Mutex<S>>>,
+}
+
+/// Sets up a listener for incoming master connections, and handles construction
+/// of a Slave on success.
+impl<S: VhostUserSlave> SlaveListener<S> {
+    /// Create a unix domain socket for incoming master connections.
+    pub fn new(path: &str, backend: Arc<Mutex<S>>) -> Result<Self> {
+        Ok(SlaveListener {
+            listener: Listener::new(path)?,
+            backend: Some(backend),
+        })
+    }
+
+    /// Accept an incoming connection from the master, returning Some(Slave) on
+    /// success, or None if the socket is nonblocking and no incoming connection
+    /// was detected
+    pub fn accept(&mut self) -> Result<Option<Slave<S>>> {
+        if let Some(fd) = self.listener.accept()? {
+            return Ok(Some(Slave::new(fd, self.backend.take().unwrap())));
+        }
+        Ok(None)
+    }
+
+    /// Change blocking status on the listener.
+    pub fn set_nonblocking(&self, block: bool) -> Result<()> {
+        self.listener.set_nonblocking(block)
+    }
+}
+
 /// A vhost-user slave endpoint which relays all received requests from the
 /// master to the virtio backend device object.
 pub struct Slave<S: VhostUserSlave> {
     // underlying Unix domain socket for communication
-    fd: Endpoint,
+    fd: Endpoint<MasterReq>,
     // the VirtIO backend device object
     backend: Arc<Mutex<S>>,
 
@@ -67,7 +101,7 @@ pub struct Slave<S: VhostUserSlave> {
 
 impl<S: VhostUserSlave> Slave<S> {
     /// Create a vhost-user slave endpoint.
-    pub fn new(fd: Endpoint, backend: Arc<Mutex<S>>) -> Self {
+    fn new(fd: Endpoint<MasterReq>, backend: Arc<Mutex<S>>) -> Self {
         Slave {
             fd,
             backend,
@@ -119,15 +153,15 @@ impl<S: VhostUserSlave> Slave<S> {
         };
 
         match hdr.get_code() {
-            VhostUserRequestCode::SET_OWNER => {
+            MasterReq::SET_OWNER => {
                 self.check_msg_size(&hdr, size, 0)?;
                 self.backend.lock().unwrap().set_owner()?;
             }
-            VhostUserRequestCode::RESET_OWNER => {
+            MasterReq::RESET_OWNER => {
                 self.check_msg_size(&hdr, size, 0)?;
                 self.backend.lock().unwrap().reset_owner()?;
             }
-            VhostUserRequestCode::GET_FEATURES => {
+            MasterReq::GET_FEATURES => {
                 self.check_msg_size(&hdr, size, 0)?;
                 let features = self.backend.lock().unwrap().get_features()?;
                 let msg = VhostUserU64::new(features);
@@ -135,13 +169,13 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.virtio_features = features;
                 self.update_reply_ack_flag();
             }
-            VhostUserRequestCode::SET_FEATURES => {
+            MasterReq::SET_FEATURES => {
                 let msg = self.extract_msg_body::<VhostUserU64>(&hdr, size, &buf)?;
                 self.backend.lock().unwrap().set_features(msg.value)?;
                 self.acked_virtio_features = msg.value;
                 self.update_reply_ack_flag();
             }
-            VhostUserRequestCode::GET_PROTOCOL_FEATURES => {
+            MasterReq::GET_PROTOCOL_FEATURES => {
                 self.check_msg_size(&hdr, size, 0)?;
                 let features = self.backend.lock().unwrap().get_protocol_features()?;
                 let msg = VhostUserU64::new(features.bits());
@@ -149,7 +183,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.protocol_features = features;
                 self.update_reply_ack_flag();
             }
-            VhostUserRequestCode::SET_PROTOCOL_FEATURES => {
+            MasterReq::SET_PROTOCOL_FEATURES => {
                 let msg = self.extract_msg_body::<VhostUserU64>(&hdr, size, &buf)?;
                 self.backend
                     .lock()
@@ -158,11 +192,11 @@ impl<S: VhostUserSlave> Slave<S> {
                 self.acked_protocol_features = msg.value;
                 self.update_reply_ack_flag();
             }
-            VhostUserRequestCode::SET_MEM_TABLE => {
+            MasterReq::SET_MEM_TABLE => {
                 let res = self.set_mem_table(&hdr, size, &buf, rfds);
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::GET_QUEUE_NUM => {
+            MasterReq::GET_QUEUE_NUM => {
                 if self.acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() == 0 {
                     return Err(Error::InvalidOperation);
                 }
@@ -171,7 +205,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 let msg = VhostUserU64::new(num);
                 self.send_reply_message(&hdr, &msg)?;
             }
-            VhostUserRequestCode::SET_VRING_NUM => {
+            MasterReq::SET_VRING_NUM => {
                 let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 let res = self
                     .backend
@@ -180,7 +214,7 @@ impl<S: VhostUserSlave> Slave<S> {
                     .set_vring_num(msg.index, msg.num);
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::SET_VRING_ADDR => {
+            MasterReq::SET_VRING_ADDR => {
                 let msg = self.extract_msg_body::<VhostUserVringAddr>(&hdr, size, &buf)?;
                 let flags = match VhostUserVringAddrFlags::from_bits(msg.flags) {
                     Some(val) => val,
@@ -196,7 +230,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 );
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::SET_VRING_BASE => {
+            MasterReq::SET_VRING_BASE => {
                 let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 let res = self
                     .backend
@@ -205,30 +239,30 @@ impl<S: VhostUserSlave> Slave<S> {
                     .set_vring_base(msg.index, msg.num);
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::GET_VRING_BASE => {
+            MasterReq::GET_VRING_BASE => {
                 let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 let reply = self.backend.lock().unwrap().get_vring_base(msg.index)?;
                 self.send_reply_message(&hdr, &reply)?;
             }
-            VhostUserRequestCode::SET_VRING_CALL => {
+            MasterReq::SET_VRING_CALL => {
                 self.check_msg_size(&hdr, size, mem::size_of::<VhostUserU64>())?;
                 let (index, rfds) = self.handle_vring_fd_request(&buf, rfds)?;
                 let res = self.backend.lock().unwrap().set_vring_call(index, rfds);
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::SET_VRING_KICK => {
+            MasterReq::SET_VRING_KICK => {
                 self.check_msg_size(&hdr, size, mem::size_of::<VhostUserU64>())?;
                 let (index, rfds) = self.handle_vring_fd_request(&buf, rfds)?;
                 let res = self.backend.lock().unwrap().set_vring_kick(index, rfds);
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::SET_VRING_ERR => {
+            MasterReq::SET_VRING_ERR => {
                 self.check_msg_size(&hdr, size, mem::size_of::<VhostUserU64>())?;
                 let (index, rfds) = self.handle_vring_fd_request(&buf, rfds)?;
                 let res = self.backend.lock().unwrap().set_vring_err(index, rfds);
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::SET_VRING_ENABLE => {
+            MasterReq::SET_VRING_ENABLE => {
                 let msg = self.extract_msg_body::<VhostUserVringState>(&hdr, size, &buf)?;
                 if self.acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() == 0
                     && msg.index > 0
@@ -248,14 +282,14 @@ impl<S: VhostUserSlave> Slave<S> {
                     .set_vring_enable(msg.index, enable);
                 self.send_ack_message(&hdr, res)?;
             }
-            VhostUserRequestCode::GET_CONFIG => {
+            MasterReq::GET_CONFIG => {
                 if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
                     return Err(Error::InvalidOperation);
                 }
                 self.check_msg_size(&hdr, size, mem::size_of::<VhostUserConfig>())?;
                 self.get_config(&hdr, &buf)?;
             }
-            VhostUserRequestCode::SET_CONFIG => {
+            MasterReq::SET_CONFIG => {
                 if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
                     return Err(Error::InvalidOperation);
                 }
@@ -271,7 +305,7 @@ impl<S: VhostUserSlave> Slave<S> {
 
     fn set_mem_table(
         &mut self,
-        hdr: &VhostUserMsgHeader,
+        hdr: &VhostUserMsgHeader<MasterReq>,
         size: usize,
         buf: &Vec<u8>,
         rfds: Option<Vec<RawFd>>,
@@ -281,16 +315,16 @@ impl<S: VhostUserSlave> Slave<S> {
         // check message size is consistent
         let hdrsize = mem::size_of::<VhostUserMemory>();
         if size < hdrsize {
-            Endpoint::close_rfds(rfds);
+            Endpoint::<MasterReq>::close_rfds(rfds);
             return Err(Error::InvalidMessage);
         }
         let msg = unsafe { &*(buf.as_ptr() as *const VhostUserMemory) };
         if !msg.is_valid() {
-            Endpoint::close_rfds(rfds);
+            Endpoint::<MasterReq>::close_rfds(rfds);
             return Err(Error::InvalidMessage);
         }
         if size != hdrsize + msg.num_regions as usize * mem::size_of::<VhostUserMemoryRegion>() {
-            Endpoint::close_rfds(rfds);
+            Endpoint::<MasterReq>::close_rfds(rfds);
             return Err(Error::InvalidMessage);
         }
 
@@ -299,7 +333,7 @@ impl<S: VhostUserSlave> Slave<S> {
             None => return Err(Error::InvalidMessage),
             Some(fds) => {
                 if fds.len() != msg.num_regions as usize {
-                    Endpoint::close_rfds(Some(fds));
+                    Endpoint::<MasterReq>::close_rfds(Some(fds));
                     return Err(Error::InvalidMessage);
                 }
                 fds
@@ -315,7 +349,7 @@ impl<S: VhostUserSlave> Slave<S> {
         };
         for region in regions.iter() {
             if !region.is_valid() {
-                Endpoint::close_rfds(Some(fds));
+                Endpoint::<MasterReq>::close_rfds(Some(fds));
                 return Err(Error::InvalidMessage);
             }
         }
@@ -323,7 +357,7 @@ impl<S: VhostUserSlave> Slave<S> {
         self.backend.lock().unwrap().set_mem_table(&regions, &fds)
     }
 
-    fn get_config(&mut self, hdr: &VhostUserMsgHeader, buf: &[u8]) -> Result<()> {
+    fn get_config(&mut self, hdr: &VhostUserMsgHeader<MasterReq>, buf: &[u8]) -> Result<()> {
         let msg = unsafe { &*(buf.as_ptr() as *const VhostUserConfig) };
         if !msg.is_valid() {
             return Err(Error::InvalidMessage);
@@ -358,7 +392,12 @@ impl<S: VhostUserSlave> Slave<S> {
         Ok(())
     }
 
-    fn set_config(&mut self, hdr: &VhostUserMsgHeader, size: usize, buf: &[u8]) -> Result<()> {
+    fn set_config(
+        &mut self,
+        hdr: &VhostUserMsgHeader<MasterReq>,
+        size: usize,
+        buf: &[u8],
+    ) -> Result<()> {
         if size < mem::size_of::<VhostUserConfig>() {
             return Err(Error::InvalidMessage);
         }
@@ -409,7 +448,7 @@ impl<S: VhostUserSlave> Slave<S> {
                 if !nofd && fds.len() == 1 {
                     rfd = Some(fds[0]);
                 } else if (nofd && fds.len() > 0) || (!nofd && fds.len() != 1) {
-                    Endpoint::close_rfds(Some(fds));
+                    Endpoint::<MasterReq>::close_rfds(Some(fds));
                     return Err(Error::InvalidMessage);
                 }
             }
@@ -429,7 +468,12 @@ impl<S: VhostUserSlave> Slave<S> {
         Ok(())
     }
 
-    fn check_msg_size(&self, hdr: &VhostUserMsgHeader, size: usize, expected: usize) -> Result<()> {
+    fn check_msg_size(
+        &self,
+        hdr: &VhostUserMsgHeader<MasterReq>,
+        size: usize,
+        expected: usize,
+    ) -> Result<()> {
         if hdr.get_size() as usize != expected
             || hdr.is_reply()
             || hdr.get_version() != 0x1
@@ -442,17 +486,17 @@ impl<S: VhostUserSlave> Slave<S> {
 
     fn check_attached_rfds(
         &self,
-        hdr: &VhostUserMsgHeader,
+        hdr: &VhostUserMsgHeader<MasterReq>,
         rfds: Option<Vec<RawFd>>,
     ) -> Result<Option<Vec<RawFd>>> {
         match hdr.get_code() {
-            VhostUserRequestCode::SET_MEM_TABLE => Ok(rfds),
-            VhostUserRequestCode::SET_VRING_CALL => Ok(rfds),
-            VhostUserRequestCode::SET_VRING_KICK => Ok(rfds),
-            VhostUserRequestCode::SET_VRING_ERR => Ok(rfds),
+            MasterReq::SET_MEM_TABLE => Ok(rfds),
+            MasterReq::SET_VRING_CALL => Ok(rfds),
+            MasterReq::SET_VRING_KICK => Ok(rfds),
+            MasterReq::SET_VRING_ERR => Ok(rfds),
             _ => {
                 if rfds.is_some() {
-                    Endpoint::close_rfds(rfds);
+                    Endpoint::<MasterReq>::close_rfds(rfds);
                     return Err(Error::InvalidMessage);
                 } else {
                     Ok(rfds)
@@ -463,7 +507,7 @@ impl<S: VhostUserSlave> Slave<S> {
 
     fn extract_msg_body<'a, T: Sized + VhostUserMsgValidator>(
         &self,
-        hdr: &VhostUserMsgHeader,
+        hdr: &VhostUserMsgHeader<MasterReq>,
         size: usize,
         buf: &'a Vec<u8>,
     ) -> Result<&'a T> {
@@ -489,7 +533,10 @@ impl<S: VhostUserSlave> Slave<S> {
         }
     }
 
-    fn new_reply_header<T: Sized>(&self, req: &VhostUserMsgHeader) -> Result<VhostUserMsgHeader> {
+    fn new_reply_header<T: Sized>(
+        &self,
+        req: &VhostUserMsgHeader<MasterReq>,
+    ) -> Result<VhostUserMsgHeader<MasterReq>> {
         if self.failed {
             return Err(Error::AlreadyClosed);
         } else if mem::size_of::<T>() > MAX_MSG_SIZE {
@@ -502,7 +549,11 @@ impl<S: VhostUserSlave> Slave<S> {
         ))
     }
 
-    fn send_ack_message(&mut self, req: &VhostUserMsgHeader, res: Result<()>) -> Result<()> {
+    fn send_ack_message(
+        &mut self,
+        req: &VhostUserMsgHeader<MasterReq>,
+        res: Result<()>,
+    ) -> Result<()> {
         if self.reply_ack_enabled {
             let hdr = self.new_reply_header::<VhostUserU64>(req)?;
             let val = match res {
@@ -515,7 +566,11 @@ impl<S: VhostUserSlave> Slave<S> {
         Ok(())
     }
 
-    fn send_reply_message<T>(&mut self, req: &VhostUserMsgHeader, msg: &T) -> Result<()> {
+    fn send_reply_message<T>(
+        &mut self,
+        req: &VhostUserMsgHeader<MasterReq>,
+        msg: &T,
+    ) -> Result<()> {
         let hdr = self.new_reply_header::<T>(req)?;
         self.fd.send_message(&hdr, msg, None)?;
         Ok(())
@@ -523,7 +578,7 @@ impl<S: VhostUserSlave> Slave<S> {
 
     fn send_reply_with_payload<T, P>(
         &mut self,
-        req: &VhostUserMsgHeader,
+        req: &VhostUserMsgHeader<MasterReq>,
         msg: &T,
         payload: &[P],
     ) -> Result<()>

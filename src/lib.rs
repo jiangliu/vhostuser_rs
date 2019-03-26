@@ -31,10 +31,11 @@ mod dummy_slave;
 mod master;
 pub mod message;
 mod slave;
+mod slave_req_handler;
 
-pub use connection::{Endpoint, Listener};
 pub use master::{Master, UserMemoryContext, VhostUserMaster};
-pub use slave::{Slave, VhostUserSlave};
+pub use slave::{Slave, SlaveListener, VhostUserSlave};
+pub use slave_req_handler::{SlaveReqHandler, VhostUserSlaveReqHandler};
 
 #[derive(Debug)]
 pub enum Error {
@@ -62,6 +63,8 @@ pub enum Error {
     InvalidOperation,
     /// Operation failed on slave side
     OperationFailedInSlave,
+    /// Error in Slave request handler
+    SlaveReqHandlerError(Box<dyn std::error::Error>),
 }
 
 impl std::convert::From<nix::Error> for Error {
@@ -71,6 +74,7 @@ impl std::convert::From<nix::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type HandlerResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[cfg(test)]
 mod tests {
@@ -87,11 +91,9 @@ mod tests {
 
     fn create_slave<S: VhostUserSlave>(path: &str, backend: Arc<Mutex<S>>) -> (Master, Slave<S>) {
         remove_temp_file(path);
-        let listener = Listener::new(path).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let mut slave_listener = SlaveListener::new(path, backend).unwrap();
         let master = Master::new(path).unwrap();
-        let slave_fd = listener.accept().unwrap().unwrap();
-        (master, Slave::new(slave_fd, backend))
+        (master, slave_listener.accept().unwrap().unwrap())
     }
 
     #[test]

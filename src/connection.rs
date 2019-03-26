@@ -4,6 +4,7 @@
 use nix::sys::socket::{recvmsg, sendmsg, CmsgSpace, ControlMessage, MsgFlags};
 use nix::sys::uio::IoVec;
 use std::io::ErrorKind;
+use std::marker::PhantomData;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::{mem, slice};
@@ -12,7 +13,7 @@ use super::message::*;
 use super::{Error, Result};
 
 /// Unix domain socket listener for vhost-user slaves.
-pub struct Listener {
+pub(crate) struct Listener {
     fd: UnixListener,
 }
 
@@ -24,7 +25,7 @@ impl Listener {
     }
 
     /// Accept an incoming connection from the master.
-    pub fn accept(&self) -> Result<Option<Endpoint>> {
+    pub fn accept(&self) -> Result<Option<Endpoint<MasterReq>>> {
         match self.fd.accept() {
             Ok((socket, _addr)) => Ok(Some(Endpoint::new_slave(socket))),
             Err(e) => {
@@ -40,10 +41,10 @@ impl Listener {
 
     /// Change blocking status on the listener.
     pub fn set_nonblocking(&self, block: bool) -> Result<()> {
-        self.fd.set_nonblocking(block)
+        self.fd
+            .set_nonblocking(block)
             .map_err(|e| Error::SocketError(e))
     }
-
 }
 
 impl AsRawFd for Listener {
@@ -53,21 +54,30 @@ impl AsRawFd for Listener {
 }
 
 /// Unix domain socket endpoint for vhostuser connection.
-pub struct Endpoint {
+pub(crate) struct Endpoint<R: Req> {
     fd: UnixStream,
     master: bool,
+    _r: PhantomData<R>,
 }
 
-impl Endpoint {
+impl<R: Req> Endpoint<R> {
     /// Create a master endpoint for a vhost-user connection.
     pub fn new_master(path: &str) -> Result<Self> {
         let fd = UnixStream::connect(path).map_err(|e| Error::ConnectFail(e))?;
-        Ok(Endpoint { fd, master: true })
+        Ok(Endpoint {
+            fd,
+            master: true,
+            _r: PhantomData,
+        })
     }
 
     /// Create a slave endpoint for a vhost-user connection.
     pub fn new_slave(fd: UnixStream) -> Self {
-        Endpoint { fd, master: false }
+        Endpoint {
+            fd,
+            master: false,
+            _r: PhantomData,
+        }
     }
 
     /// Check whether the endpoint is in master mode.
@@ -103,15 +113,19 @@ impl Endpoint {
     }
 
     /// Sends a header-only message with optional attached file descriptors.
-    pub fn send_header(&mut self, hdr: &VhostUserMsgHeader, fds: Option<&[RawFd]>) -> Result<()> {
+    pub fn send_header(
+        &mut self,
+        hdr: &VhostUserMsgHeader<R>,
+        fds: Option<&[RawFd]>,
+    ) -> Result<()> {
         let iovs = [IoVec::from_slice(unsafe {
             slice::from_raw_parts(
-                hdr as *const VhostUserMsgHeader as *const u8,
-                mem::size_of::<VhostUserMsgHeader>(),
+                hdr as *const VhostUserMsgHeader<R> as *const u8,
+                mem::size_of::<VhostUserMsgHeader<R>>(),
             )
         })];
         let bytes = self.send_iovec(&iovs[..], fds)?;
-        if bytes != mem::size_of::<VhostUserMsgHeader>() {
+        if bytes != mem::size_of::<VhostUserMsgHeader<R>>() {
             return Err(Error::PartialMessage);
         }
         Ok(())
@@ -121,15 +135,15 @@ impl Endpoint {
     /// attached to the message.
     pub fn send_message<T: Sized>(
         &mut self,
-        hdr: &VhostUserMsgHeader,
+        hdr: &VhostUserMsgHeader<R>,
         body: &T,
         fds: Option<&[RawFd]>,
     ) -> Result<()> {
         let iovs = [
             IoVec::from_slice(unsafe {
                 slice::from_raw_parts(
-                    hdr as *const VhostUserMsgHeader as *const u8,
-                    mem::size_of::<VhostUserMsgHeader>(),
+                    hdr as *const VhostUserMsgHeader<R> as *const u8,
+                    mem::size_of::<VhostUserMsgHeader<R>>(),
                 )
             }),
             IoVec::from_slice(unsafe {
@@ -137,7 +151,7 @@ impl Endpoint {
             }),
         ];
         let bytes = self.send_iovec(&iovs[..], fds)?;
-        if bytes != mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>() {
+        if bytes != mem::size_of::<VhostUserMsgHeader<R>>() + mem::size_of::<T>() {
             return Err(Error::PartialMessage);
         }
         Ok(())
@@ -147,7 +161,7 @@ impl Endpoint {
     /// may also be attached to the message.
     pub fn send_message_with_payload<T: Sized, P: Sized>(
         &mut self,
-        hdr: &VhostUserMsgHeader,
+        hdr: &VhostUserMsgHeader<R>,
         body: &T,
         payload: &[P],
         fds: Option<&[RawFd]>,
@@ -165,8 +179,8 @@ impl Endpoint {
         let iovs = [
             IoVec::from_slice(unsafe {
                 slice::from_raw_parts(
-                    hdr as *const VhostUserMsgHeader as *const u8,
-                    mem::size_of::<VhostUserMsgHeader>(),
+                    hdr as *const VhostUserMsgHeader<R> as *const u8,
+                    mem::size_of::<VhostUserMsgHeader<R>>(),
                 )
             }),
             IoVec::from_slice(unsafe {
@@ -174,7 +188,7 @@ impl Endpoint {
             }),
             IoVec::from_slice(unsafe { slice::from_raw_parts(payload.as_ptr() as *const u8, len) }),
         ];
-        let total = mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>() + len;
+        let total = mem::size_of::<VhostUserMsgHeader<R>>() + mem::size_of::<T>() + len;
         let len = self.send_iovec(&iovs, fds)?;
         if len != total {
             return Err(Error::PartialMessage);
@@ -244,42 +258,42 @@ impl Endpoint {
     pub fn recv_message_into_buf(
         &mut self,
         buf: &mut [u8],
-    ) -> Result<(VhostUserMsgHeader, usize, Option<Vec<RawFd>>)> {
+    ) -> Result<(VhostUserMsgHeader<R>, usize, Option<Vec<RawFd>>)> {
         let mut hdr = VhostUserMsgHeader::default();
         let iovs = [
             IoVec::from_mut_slice(unsafe {
                 slice::from_raw_parts_mut(
-                    (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
-                    mem::size_of::<VhostUserMsgHeader>(),
+                    (&mut hdr as *mut VhostUserMsgHeader<R>) as *mut u8,
+                    mem::size_of::<VhostUserMsgHeader<R>>(),
                 )
             }),
             IoVec::from_mut_slice(buf),
         ];
         let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
 
-        if bytes < mem::size_of::<VhostUserMsgHeader>() {
+        if bytes < mem::size_of::<VhostUserMsgHeader<R>>() {
             return Err(Error::PartialMessage);
         } else if !hdr.is_valid() {
             return Err(Error::InvalidMessage);
         }
 
-        Ok((hdr, bytes - mem::size_of::<VhostUserMsgHeader>(), rfds))
+        Ok((hdr, bytes - mem::size_of::<VhostUserMsgHeader<R>>(), rfds))
     }
 
     /// Receive a header-only message with optional attached file descriptors.
     /// Note, only the first MAX_ATTECHED_FD_ENTRIES file descriptors will be
     /// accepted and all other file descriptor will be discard silently.
-    pub fn recv_header(&mut self) -> Result<(VhostUserMsgHeader, Option<Vec<RawFd>>)> {
+    pub fn recv_header(&mut self) -> Result<(VhostUserMsgHeader<R>, Option<Vec<RawFd>>)> {
         let mut hdr = VhostUserMsgHeader::default();
         let iovs = [IoVec::from_mut_slice(unsafe {
             slice::from_raw_parts_mut(
-                (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
-                mem::size_of::<VhostUserMsgHeader>(),
+                (&mut hdr as *mut VhostUserMsgHeader<R>) as *mut u8,
+                mem::size_of::<VhostUserMsgHeader<R>>(),
             )
         })];
         let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
 
-        if bytes != mem::size_of::<VhostUserMsgHeader>() {
+        if bytes != mem::size_of::<VhostUserMsgHeader<R>>() {
             return Err(Error::PartialMessage);
         } else if !hdr.is_valid() {
             return Err(Error::InvalidMessage);
@@ -293,14 +307,14 @@ impl Endpoint {
     /// accepted and all other file descriptor will be discard silently.
     pub fn recv_message<T: Sized + Default + VhostUserMsgValidator>(
         &mut self,
-    ) -> Result<(VhostUserMsgHeader, T, Option<Vec<RawFd>>)> {
+    ) -> Result<(VhostUserMsgHeader<R>, T, Option<Vec<RawFd>>)> {
         let mut hdr = VhostUserMsgHeader::default();
         let mut body: T = Default::default();
         let iovs = [
             IoVec::from_mut_slice(unsafe {
                 slice::from_raw_parts_mut(
-                    (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
-                    mem::size_of::<VhostUserMsgHeader>(),
+                    (&mut hdr as *mut VhostUserMsgHeader<R>) as *mut u8,
+                    mem::size_of::<VhostUserMsgHeader<R>>(),
                 )
             }),
             IoVec::from_mut_slice(unsafe {
@@ -309,7 +323,7 @@ impl Endpoint {
         ];
         let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
 
-        let total = mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>();
+        let total = mem::size_of::<VhostUserMsgHeader<R>>() + mem::size_of::<T>();
         if bytes != total {
             return Err(Error::PartialMessage);
         } else if !hdr.is_valid() || !body.is_valid() {
@@ -325,14 +339,14 @@ impl Endpoint {
     pub fn recv_message_with_payload<T: Sized + Default + VhostUserMsgValidator>(
         &mut self,
         buf: &mut [u8],
-    ) -> Result<(VhostUserMsgHeader, T, usize, Option<Vec<RawFd>>)> {
+    ) -> Result<(VhostUserMsgHeader<R>, T, usize, Option<Vec<RawFd>>)> {
         let mut hdr = VhostUserMsgHeader::default();
         let mut body: T = Default::default();
         let iovs = [
             IoVec::from_mut_slice(unsafe {
                 slice::from_raw_parts_mut(
-                    (&mut hdr as *mut VhostUserMsgHeader) as *mut u8,
-                    mem::size_of::<VhostUserMsgHeader>(),
+                    (&mut hdr as *mut VhostUserMsgHeader<R>) as *mut u8,
+                    mem::size_of::<VhostUserMsgHeader<R>>(),
                 )
             }),
             IoVec::from_mut_slice(unsafe {
@@ -342,7 +356,7 @@ impl Endpoint {
         ];
         let (bytes, rfds) = self.recv_into_iovec::<[RawFd; MAX_ATTECHED_FD_ENTRIES]>(&iovs[..])?;
 
-        let total = mem::size_of::<VhostUserMsgHeader>() + mem::size_of::<T>();
+        let total = mem::size_of::<VhostUserMsgHeader<R>>() + mem::size_of::<T>();
         if bytes < total {
             return Err(Error::PartialMessage);
         } else if !hdr.is_valid() || !body.is_valid() {
@@ -362,7 +376,7 @@ impl Endpoint {
     }
 }
 
-impl AsRawFd for Endpoint {
+impl<T: Req> AsRawFd for Endpoint<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
@@ -418,7 +432,7 @@ mod tests {
         remove_temp_file(UNIX_SOCKET_DATA);
         let listener = Listener::new(UNIX_SOCKET_DATA).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut master = Endpoint::new_master(UNIX_SOCKET_DATA).unwrap();
+        let mut master = Endpoint::<MasterReq>::new_master(UNIX_SOCKET_DATA).unwrap();
         let mut slave = listener.accept().unwrap().unwrap();
 
         let buf1 = vec![0x1, 0x2, 0x3, 0x4];
@@ -443,7 +457,7 @@ mod tests {
         remove_temp_file(UNIX_SOCKET_FD);
         let listener = Listener::new(UNIX_SOCKET_FD).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut master = Endpoint::new_master(UNIX_SOCKET_FD).unwrap();
+        let mut master = Endpoint::<MasterReq>::new_master(UNIX_SOCKET_FD).unwrap();
         let mut slave = listener.accept().unwrap().unwrap();
 
         let mut fd = tempfile().unwrap();
@@ -589,8 +603,8 @@ mod tests {
         assert_eq!(bytes, 4);
         assert!(rfds.is_some());
 
-        Endpoint::close_rfds(rfds);
-        Endpoint::close_rfds(None);
+        Endpoint::<MasterReq>::close_rfds(rfds);
+        Endpoint::<MasterReq>::close_rfds(None);
     }
 
     #[test]
@@ -598,11 +612,11 @@ mod tests {
         remove_temp_file(UNIX_SOCKET_SEND);
         let listener = Listener::new(UNIX_SOCKET_SEND).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut master = Endpoint::new_master(UNIX_SOCKET_SEND).unwrap();
+        let mut master = Endpoint::<MasterReq>::new_master(UNIX_SOCKET_SEND).unwrap();
         let mut slave = listener.accept().unwrap().unwrap();
 
         let mut hdr1 = VhostUserMsgHeader::new(
-            VhostUserRequestCode::GET_FEATURES,
+            MasterReq::GET_FEATURES,
             0,
             mem::size_of::<u64>() as u32,
         );
