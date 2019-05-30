@@ -125,7 +125,7 @@ impl Master {
     ///
     /// # Arguments
     /// * `path` - path of Unix domain socket listener to connect to
-    pub fn new(path: &str) -> Result<Self> {
+    pub fn new(path: &str, max_queue_num: u64) -> Result<Self> {
         let conn = Endpoint::new_master(path)?;
         Ok(Master {
             node: Mutex::new(MasterInternal {
@@ -136,7 +136,7 @@ impl Master {
                 protocol_features: 0,
                 acked_protocol_features: 0,
                 protocol_features_ready: false,
-                max_queue_num: 1,
+                max_queue_num,
                 failed: false,
             }),
         })
