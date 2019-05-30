@@ -1,7 +1,8 @@
 // Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use nix::sys::socket::{recvmsg, sendmsg, CmsgSpace, ControlMessage, MsgFlags};
+use nix::cmsg_space;
+use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags};
 use nix::sys::uio::IoVec;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
@@ -213,7 +214,7 @@ impl<R: Req> Endpoint<R> {
         &mut self,
         iov: &[IoVec<&mut [u8]>],
     ) -> Result<(usize, Option<Vec<RawFd>>)> {
-        let mut cmsgspace: CmsgSpace<F> = CmsgSpace::new();
+        let mut cmsgspace = cmsg_space!([RawFd; 2]);
         let msg = recvmsg(
             self.as_raw_fd(),
             iov,
@@ -223,10 +224,10 @@ impl<R: Req> Endpoint<R> {
 
         let mut rfds = None;
         for cmsg in msg.cmsgs() {
-            if let ControlMessage::ScmRights(fds) = cmsg {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg {
                 if fds.len() >= 1 {
                     let mut fd_arr = Vec::with_capacity(fds.len());
-                    fd_arr.extend_from_slice(fds);
+                    fd_arr.extend_from_slice(&fds);
                     rfds = Some(fd_arr);
                 }
             }
